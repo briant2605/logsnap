@@ -1,71 +1,78 @@
-"""Pipeline: wires together tailer, filter, throttle, metrics, and output."""
-from __future__ import annotations
+"""Event processing pipeline: filter → dedup → throttle → emit."""
 
+import queue
 import threading
-from typing import List, Optional
+from typing import Optional
 
-from logsnap.aggregator import LogAggregator, LogEvent
+from logsnap.aggregator import LogEvent
 from logsnap.filter import LineFilter
+from logsnap.output import PlainFormatter
 from logsnap.metrics import MetricsCollector
-from logsnap.output import PlainFormatter, JsonFormatter, BaseFormatter
 from logsnap.throttle import ThrottleManager
+from logsnap.dedup import DedupFilter
 
 
 class Pipeline:
-    """Connects aggregation, filtering, throttling, metrics, and output."""
+    """Consume *LogEvent* objects from a queue, apply filter/dedup/throttle,
+    then emit via a formatter.
+    """
 
     def __init__(
         self,
-        aggregator: LogAggregator,
+        event_queue: queue.Queue,
         line_filter: Optional[LineFilter] = None,
-        throttle: Optional[ThrottleManager] = None,
+        formatter=None,
         metrics: Optional[MetricsCollector] = None,
-        formatter: Optional[BaseFormatter] = None,
-        output_stream=None,
+        throttle: Optional[ThrottleManager] = None,
+        dedup: Optional[DedupFilter] = None,
+        stream=None,
     ) -> None:
-        self._aggregator = aggregator
+        self._q = event_queue
         self._filter = line_filter or LineFilter()
-        self._throttle = throttle or ThrottleManager({})
-        self._metrics = metrics or MetricsCollector()
-        self._formatter = formatter or PlainFormatter(use_color=False)
-        self._stream = output_stream
-        self._stop_event = threading.Event()
+        self._formatter = formatter or PlainFormatter(stream=stream)
+        self._metrics = metrics
+        self._throttle = throttle
+        self._dedup = dedup
+        self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     def _process_event(self, event: LogEvent) -> None:
-        source = event.source
-        line = event.line
-
-        if not self._filter.matches(line):
-            self._metrics.record_line(source, matched=False)
+        matched = self._filter.matches(event.line)
+        if self._metrics:
+            self._metrics.record_line(event.source, matched=matched)
+        if not matched:
             return
-
-        if not self._throttle.allow(source):
-            self._metrics.record_line(source, matched=True)
+        if self._dedup and self._dedup.is_duplicate(event.line):
             return
+        if self._throttle and not self._throttle.allow(event.source):
+            return
+        self._formatter.emit(event)
 
-        self._metrics.record_line(source, matched=True)
-        self._formatter.emit(event, stream=self._stream)
-
-    # ------------------------------------------------------------------
     def _run_loop(self) -> None:
-        for event in self._aggregator.events(stop_event=self._stop_event):
+        while not self._stop.is_set():
+            try:
+                event = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
             self._process_event(event)
+            self._q.task_done()
 
     def start(self) -> None:
-        """Start the pipeline in a background thread."""
-        self._aggregator.start()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
-        """Signal the pipeline to stop and wait for clean shutdown."""
-        self._stop_event.set()
-        self._aggregator.stop()
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
         if self._thread:
             self._thread.join(timeout=timeout)
 
-    @property
-    def metrics(self) -> MetricsCollector:
-        return self._metrics
+    def drain(self) -> None:
+        """Process all currently queued events synchronously (useful in tests)."""
+        while not self._q.empty():
+            try:
+                event = self._q.get_nowait()
+            except queue.Empty:
+                break
+            self._process_event(event)
+            self._q.task_done()
