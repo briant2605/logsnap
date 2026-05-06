@@ -52,6 +52,25 @@ class CheckpointManager:
                     pass
             self._store.save()
 
+    def add_tailer(self, tailer: LogTailer) -> None:
+        """Register a new tailer with the manager at runtime.
+
+        If a checkpoint already exists for the tailer's path and the inode
+        matches, the tailer is immediately seeked to its last known offset.
+        """
+        with self._lock:
+            self._tailers[tailer.path] = tailer
+        # Attempt to restore position for the newly added tailer.
+        pos = self._store.get(tailer.path)
+        if pos is None or tailer._fh is None:
+            return
+        try:
+            inode = os.stat(tailer.path).st_ino
+        except FileNotFoundError:
+            return
+        if inode == pos.inode:
+            tailer._fh.seek(pos.offset)
+
     def _schedule(self) -> None:
         if self._stopped:
             return
