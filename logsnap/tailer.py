@@ -26,6 +26,17 @@ class LogTailer:
         except FileNotFoundError:
             return True
 
+    def _reopen_after_rotation(self) -> None:
+        """Close the current file handle and reopen after a rotation event.
+
+        Waits until the new file exists before reopening, so lines written
+        to the replacement file are not missed.
+        """
+        self._file.close()
+        while not os.path.exists(self.filepath):
+            time.sleep(self.poll_interval)
+        self._open()
+
     def tail(self) -> Generator[str, None, None]:
         """Yield new lines from the file indefinitely."""
         while not os.path.exists(self.filepath):
@@ -39,8 +50,7 @@ class LogTailer:
                     yield line.rstrip("\n")
                 else:
                     if self._rotated():
-                        self._file.close()
-                        self._open()
+                        self._reopen_after_rotation()
                     else:
                         time.sleep(self.poll_interval)
         finally:
